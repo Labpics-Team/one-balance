@@ -264,9 +264,7 @@ async function makeGatewayRequest(
     const newHeaders = new Headers(headers)
     setAuthHeader(newHeaders, restResource, key)
 
-    const gateways = env.AI_GATEWAY.split(',').map(s => s.trim())
-    const selected = gateways[Math.floor(Math.random() * gateways.length)]
-
+    const selected = selectGateway(env)
     let base = await env.AI.gateway(selected).getUrl()
     if (!base.endsWith('/')) {
         base += '/'
@@ -279,6 +277,13 @@ async function makeGatewayRequest(
         body: body,
         redirect: 'follow'
     })
+}
+
+function selectGateway(env: Env): string {
+    const gateways = env.AI_GATEWAY.split(',').map(s => s.trim())
+    const selected = gateways[Math.floor(Math.random() * gateways.length)]
+    console.info(`selected gateway ${selected}`)
+    return selected
 }
 
 function setAuthHeader(headers: Headers, restResource: string, key: string) {
