@@ -9,7 +9,8 @@
 
 如果你有多个具有配额限制的 API 密钥（例如 Google AI Studio），`One Balance` 可以**智能**轮询使用这些密钥，从而最大化利用可用资源。
 
-**赞助项目可以领取 Gemini Key**
+
+---
 
 <table>
   <tr>
@@ -19,14 +20,21 @@
       <strong>AI 学习交流社群</strong>
     </td>
     <td align="center">
-      <img src="https://github.com/glidea/zenfeed/blob/main/docs/images/sponsor.png?raw=true" width="500">
+      <img src="https://github.com/glidea/banana-prompt-quicker/blob/main/images/glidea.png?raw=true" width="250">
       <br>
-      <strong><a href="https://afdian.com/a/glidea">请杯奶茶 🧋</a></strong>
+      <strong><a href="https://glidea.zenfeed.xyz/">我的其它项目</a></strong>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <img src="https://github.com/glidea/banana-prompt-quicker/blob/main/images/readnote.png?raw=true" width="400">
+      <br>
+      <strong><a href="https://www.xiaohongshu.com/user/profile/5f7dc54d0000000001004afb">📕 小红书账号 - 持续分享 AI 原创</a></strong>
     </td>
   </tr>
 </table>
-<br/>
-<a href="https://afdian.com/a/glidea">赞助项目，支持发展</a>
+
+---
 
 ## 特性
 
