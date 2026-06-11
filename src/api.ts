@@ -18,6 +18,12 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext):
     const url = new URL(request.url)
     const restResource = url.pathname.substring('/api/'.length) + url.search
 
+    // Key Manager API (consumed by ai-node): vend a key / report its status.
+    // Authenticated by KEY_MANAGER_TOKEN, separate from the proxy auth below.
+    if (restResource.startsWith('keys/')) {
+        return handleKeys(request, env)
+    }
+
     const provider = restResource.split('/')[0]
     const authKey = getAuthKey(request, provider)
     const realProviderAndModel = await extractRealProviderAndModel(request, restResource, provider)
@@ -30,6 +36,107 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext):
     }
 
     return await forward(request, env, ctx, restResource, realProviderAndModel.provider, realProviderAndModel.model)
+}
+
+// ─── Key Manager API ──────────────────────────────────────────────────────
+// Vends pooled keys to ai-node (which then calls the provider directly) and
+// receives key-health reports back. This is a separate trust boundary from the
+// proxy path: authenticated by a single KEY_MANAGER_TOKEN, not the AUTH_KEY set.
+
+function checkKeyManagerAuth(request: Request, env: Env): Response | null {
+    const token = env.KEY_MANAGER_TOKEN
+    if (!token) {
+        return new Response('KEY_MANAGER_TOKEN not configured', { status: 500 })
+    }
+    const auth = request.headers.get('Authorization') ?? ''
+    if (auth !== `Bearer ${token}`) {
+        return new Response('Unauthorized', { status: 401 })
+    }
+    return null
+}
+
+async function handleKeys(request: Request, env: Env): Promise<Response> {
+    const authError = checkKeyManagerAuth(request, env)
+    if (authError) return authError
+
+    const path = new URL(request.url).pathname
+    if (path === '/api/keys/next' && request.method === 'GET') {
+        return handleKeysNext(request, env)
+    }
+    const statusMatch = path.match(/^\/api\/keys\/(.+)\/status$/)
+    if (statusMatch && request.method === 'POST') {
+        return handleKeysStatus(request, env, statusMatch[1])
+    }
+    return new Response('Not found', { status: 404 })
+}
+
+// GET /api/keys/next?provider=&model= → { key, id, cooling_until }
+// Picks an available key for the (provider, model); cooling_until is the unix
+// second the chosen key's model cooldown ends, or null if it's not cooling.
+async function handleKeysNext(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url)
+    const provider = url.searchParams.get('provider')
+    const model = url.searchParams.get('model')
+    if (!provider || !model) {
+        return new Response('provider and model query params required', { status: 400 })
+    }
+
+    const activeKeys = await keyService.listActiveKeysViaCache(env, provider)
+    if (activeKeys.length === 0) {
+        return new Response('No active keys available', { status: 503 })
+    }
+
+    const selectedKey = await selectKey(activeKeys, model)
+    const cooling = selectedKey.modelCoolings?.[model]
+    const coolingUntil = cooling && cooling.end_at > Date.now() / 1000 ? cooling.end_at : null
+
+    return new Response(
+        JSON.stringify({ key: selectedKey.key, id: selectedKey.id, cooling_until: coolingUntil }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+    )
+}
+
+// POST /api/keys/{id}/status — body: {blocked} | {rate_limited, retry_after, model, provider} | {ok}
+async function handleKeysStatus(request: Request, env: Env, keyId: string): Promise<Response> {
+    let body: {
+        blocked?: boolean
+        rate_limited?: boolean
+        retry_after?: number
+        ok?: boolean
+        provider?: string
+        model?: string
+    }
+    try {
+        body = await request.json()
+    } catch {
+        return new Response('Invalid JSON', { status: 400 })
+    }
+
+    if (body.blocked) {
+        // provider is required: defaulting it (previously 'google-ai-studio') could
+        // mark a key of one provider blocked under another, corrupting key health.
+        if (!body.provider) {
+            return new Response('provider required for blocked', { status: 400 })
+        }
+        await keyService.setKeyStatus(env, body.provider, keyId, 'blocked')
+        return new Response('OK', { status: 200 })
+    }
+    if (body.rate_limited && typeof body.retry_after === 'number') {
+        // provider and model are both required so the cooldown is attributed to the
+        // correct (provider, model) — never defaulted, which would mis-cool keys.
+        if (!body.provider) {
+            return new Response('provider required for rate_limited', { status: 400 })
+        }
+        if (!body.model) {
+            return new Response('model required for rate_limited', { status: 400 })
+        }
+        await keyService.setKeyModelCooldownIfAvailable(env, keyId, body.provider, body.model, body.retry_after)
+        return new Response('OK', { status: 200 })
+    }
+    if (body.ok) {
+        return new Response('OK', { status: 200 })
+    }
+    return new Response('Invalid status body: one of ok, blocked, rate_limited required', { status: 400 })
 }
 
 async function extractRealProviderAndModel(
@@ -102,10 +209,17 @@ async function forward(
     }
 
     const body = request.body ? await request.arrayBuffer() : null
-    const MAX_RETRIES = 30
+    // Bounded retries. Each key is a separate Google project, so a few attempts
+    // are enough to find one with fresh per-minute quota. Walking the whole pool
+    // (the old MAX_RETRIES=30) re-sent the full body Nx and benched every key it
+    // touched — catastrophic for a request larger than any single free project's
+    // per-minute TPM, which 429s on every key and can never succeed by rotation.
+    const MAX_RETRIES = 3
+    let lastRateLimitSec = 0 // Retry-After hint (seconds) from the most recent 429
+    let sawRateLimit = false
     for (let i = 0; i < MAX_RETRIES; i++) {
         if (activeKeys.length === 0) {
-            return new Response('No active keys available', { status: 503 })
+            break
         }
 
         const selectedKey = await selectKey(activeKeys, model)
@@ -130,48 +244,52 @@ async function forward(
             case 401:
             case 403:
                 ctx.waitUntil(keyService.setKeyStatus(env, provider, selectedKey.id, 'blocked'))
-
-                // next key
-                console.error(
-                    `key ${selectedKey.key} is blocked due to ${respFromGateway.status} ${await respFromGateway.text()}`
-                )
+                console.error(`key ${selectedKey.id} is blocked due to ${respFromGateway.status}`)
                 if (activeKeys.length < 500) {
                     // save the CPU time for Cloudflare Free plan
                     activeKeys.splice(activeKeys.indexOf(selectedKey), 1)
                 }
                 continue
 
-            // try cooling down
-            case 429:
-                const sec = await analyze429CooldownSeconds(env, respFromGateway, provider, selectedKey.key)
+            // rate limited: cool the key for the right amount (RPD → midnight PT,
+            // per-minute → the provider's RetryInfo delay) and try another key
+            case 429: {
+                const sec = await cooldownSecondsFor429(respFromGateway, provider)
                 ctx.waitUntil(keyService.setKeyModelCooldownIfAvailable(env, selectedKey.id, provider, model, sec))
-
-                // next key
+                sawRateLimit = true
+                lastRateLimitSec = sec
                 console.warn(
-                    `key ${selectedKey.key} is cooling down for model ${model} due to 429 ${await respFromGateway.text()}`
+                    `key ${selectedKey.id} cooling ${sec}s for model ${model} (429, attempt ${i + 1}/${MAX_RETRIES})`
                 )
                 if (activeKeys.length < 500) {
                     activeKeys.splice(activeKeys.indexOf(selectedKey), 1)
                 }
                 continue
+            }
 
             case 500:
             case 502:
             case 503:
             case 504:
-                console.error(`gateway returned 5xx ${await respFromGateway.text()}`)
+                console.error(`gateway returned 5xx ${respFromGateway.status}`)
                 continue // no backoff, just retry...
         }
 
-        if (status / 100 === 2) {
-            consecutive429Count.delete(selectedKey.id)
-        } else {
-            console.error(`gateway returned ${status}`)
-        }
         return respFromGateway
     }
 
-    return new Response('Internal server error after retries', { status: 500 })
+    // Retries exhausted. If the failures were rate limits, surface a real 429
+    // with a Retry-After hint so the caller backs off — not a generic 500, which
+    // made a transiently-throttled pool look like a hard outage and hid the
+    // rate-limit signal from the client.
+    if (sawRateLimit) {
+        const headers: Record<string, string> = { 'Content-Type': 'text/plain' }
+        if (lastRateLimitSec > 0) {
+            headers['Retry-After'] = String(lastRateLimitSec)
+        }
+        return new Response('Rate limited: all attempted keys are cooling down', { status: 429, headers })
+    }
+    return new Response('Upstream unavailable after retries', { status: 502 })
 }
 
 function getAuthKey(request: Request, provider: string): string {
@@ -219,7 +337,7 @@ function tryRandomSelect(keys: schema.Key[], model: string): schema.Key | null {
         const coolingEnd = randomKey.modelCoolings?.[model]?.end_at
 
         if (!coolingEnd || coolingEnd < now) {
-            console.info(`selected a key ${randomKey.key} to try; count: ${i + 1}`)
+            console.info(`selected a key ${randomKey.id} to try; count: ${i + 1}`)
             return randomKey
         }
     }
@@ -245,11 +363,11 @@ function selectFromAllKeys(keys: schema.Key[], model: string): schema.Key {
 
     if (availableKeys.length > 0) {
         const selectedKey = availableKeys[Math.floor(Math.random() * availableKeys.length)]
-        console.info(`selected available key ${selectedKey.key} after full scan`)
+        console.info(`selected available key ${selectedKey.id} after full scan`)
         return selectedKey
     }
 
-    console.warn(`selected a cooling key ${bestCoolingKey?.key} to try`)
+    console.warn(`selected a cooling key ${bestCoolingKey?.id} to try`)
     return bestCoolingKey! // may be available actually
 }
 
@@ -316,43 +434,15 @@ async function keyIsInvalid(respFromGateway: Response, provider: string): Promis
     }
 }
 
-// Using an in-memory Map to count consecutive 429s is a design choice to prioritize performance and minimize costs.
-// - Why not use D1 (DB)? To avoid database writes on every 429 error, which would increase load and latency. We only write to the DB when a key needs to be cooled down.
-// - Why not use KV? The free tier has low write quotas. Also, KV's eventual consistency makes it unsuitable for precise, real-time counting.
-// Limitation: This counter is local to each worker instance and not shared globally. If requests for the same key are routed to different instances, the count may be inaccurate.
-// However, for short-lived consecutive requests, Cloudflare often routes them to the same instance, making this a practical trade-off.
-let consecutive429Count: Map<string, number> = new Map()
-
-async function analyze429CooldownSeconds(
-    env: Env,
-    respFromGateway: Response,
-    provider: string,
-    key: string
-): Promise<number> {
-    const count = (consecutive429Count.get(key) || 0) + 1
-    consecutive429Count.set(key, count)
-
-    if (count >= Number(env.CONSECUTIVE_429_THRESHOLD)) {
-        consecutive429Count.delete(key)
-        console.error(`key ${key} triggered long cooldown after ${env.CONSECUTIVE_429_THRESHOLD} consecutive 429s`)
-        return untilResetForDay(provider)
-    }
-
-    return untilReset(respFromGateway, provider)
-}
-
-function untilResetForDay(provider: string): number {
-    if (provider === 'google-ai-studio') {
-        return util.getSecondsUntilMidnightPT()
-    }
-    if (provider === 'openrouter') {
-        return util.getSecondsUntilMidnightUTC()
-    }
-
-    return 24 * 60 * 60
-}
-
-async function untilReset(respFromGateway: Response, provider: string): Promise<number> {
+// cooldownSecondsFor429 derives how long to cool a key from the ACTUAL quota
+// signal in the 429 body, not a consecutive-count heuristic. The old code
+// benched a key until midnight PT (≤24h) after N consecutive 429s — which
+// misclassified a per-minute/size 429 as daily exhaustion and pulled healthy
+// project-keys out of rotation for the whole day. Here a per-day (RPD) signal
+// benches until midnight (rotating to another project genuinely helps), while a
+// per-minute limit yields a short cooldown (rotation does NOT help an oversized
+// request, so we cool briefly and let the bounded retry loop give up fast).
+export async function cooldownSecondsFor429(respFromGateway: Response, provider: string): Promise<number> {
     if (provider === 'google-ai-studio') {
         return untilResetForGoogleAiStudio(respFromGateway)
     }
@@ -374,16 +464,34 @@ async function untilResetForGoogleAiStudio(respFromGateway: Response): Promise<n
             const violations = quotaFailureDetail.violations || []
             for (const violation of violations) {
                 if (violation.quotaId === 'GenerateRequestsPerDayPerProjectPerModel-FreeTier') {
-                    return util.getSecondsUntilMidnightPT() // Requests per day (RPD) quotas reset at midnight Pacific time
+                    // Requests-per-day (RPD) quota — this project is done for the
+                    // day; reset is at midnight Pacific. Rotating keys helps here.
+                    console.warn('429 reason=RPD (per-day per-project) → cool until midnight PT')
+                    return util.getSecondsUntilMidnightPT()
                 }
             }
+            // QuotaFailure present but not RPD → a per-minute/per-request quota
+            // (e.g. input tokens/min). A request bigger than the free per-minute
+            // TPM will hit this on EVERY project — rotation cannot save it.
+            console.warn(
+                `429 reason=per-minute/other quota (${violations.map((v: any) => v.quotaId).join(',') || 'unknown'})`
+            )
         }
 
         const retryInfoDetail = getGoogleAiStudioErrorDetail(errorBody, 'type.googleapis.com/google.rpc.RetryInfo')
         if (retryInfoDetail && retryInfoDetail.retryDelay) {
             const retrySeconds = parseInt(retryInfoDetail.retryDelay.replace('s', ''))
-            return retrySeconds + 2 // 2 seconds buffer
+            // A malformed retryDelay (e.g. "" or "fast") makes parseInt return NaN.
+            // Never propagate a NaN cooldown — fall back to the same safe default
+            // used for an unclassified 429 instead of benching the key for NaN.
+            if (Number.isFinite(retrySeconds)) {
+                console.warn(`429 reason=RetryInfo retryDelay=${retrySeconds}s`)
+                return retrySeconds + 2 // 2 seconds buffer
+            }
+            console.warn(`429 reason=RetryInfo unparseable retryDelay='${retryInfoDetail.retryDelay}' → fallback 65s`)
+            return 65
         }
+        console.warn('429 reason=unclassified (no QuotaFailure/RetryInfo) → fallback 65s')
     } catch (error) {
         console.error('failed to parse google-ai-studio 429 response, fallback to 65 seconds', error)
     }

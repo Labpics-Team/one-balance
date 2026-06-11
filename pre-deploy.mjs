@@ -56,14 +56,14 @@ async function main() {
 
     const authKey = process.env.AUTH_KEY
     if (authKey) {
-        console.log(`Setting AUTH_KEY to '${authKey}'...`)
+        console.log('Setting AUTH_KEY (value hidden)...')
         config.vars.AUTH_KEY = authKey
     }
 
-    const consecutive429Threshold = process.env.CONSECUTIVE_429_THRESHOLD
-    if (consecutive429Threshold) {
-        console.log(`Setting CONSECUTIVE_429_THRESHOLD to '${consecutive429Threshold}'...`)
-        config.vars.CONSECUTIVE_429_THRESHOLD = consecutive429Threshold
+    const keyManagerToken = process.env.KEY_MANAGER_TOKEN
+    if (keyManagerToken) {
+        console.log('Setting KEY_MANAGER_TOKEN (value hidden)...')
+        config.vars.KEY_MANAGER_TOKEN = keyManagerToken
     }
 
     const aiGateway = process.env.AI_GATEWAY
