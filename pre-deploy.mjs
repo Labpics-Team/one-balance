@@ -72,6 +72,12 @@ async function main() {
         config.vars.AI_GATEWAY = aiGateway
     }
 
+    const upstreamTimeoutMs = process.env.UPSTREAM_TIMEOUT_MS
+    if (upstreamTimeoutMs) {
+        console.log(`Setting UPSTREAM_TIMEOUT_MS to '${upstreamTimeoutMs}'...`)
+        config.vars.UPSTREAM_TIMEOUT_MS = upstreamTimeoutMs
+    }
+
     // TODO: auto create ai gateway when wrangler supports it
 
     console.log('Checking for D1 databases...')

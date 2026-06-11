@@ -10,16 +10,18 @@ vi.mock('./service/key', () => ({
 
 import * as keyService from './service/key'
 import { handle } from './api'
+import worker from './index'
 
 const KEY_MANAGER_TOKEN = 'kmt-test'
 const AUTH_KEY = 'svc-test'
 
-function makeEnv(): Env {
+function makeEnv(overrides: Record<string, unknown> = {}): Env {
     return {
         AUTH_KEY,
         KEY_MANAGER_TOKEN,
         AI_GATEWAY: 'one-balance',
-        AI: { gateway: (_name: string) => ({ getUrl: async () => 'https://gateway.example/' }) }
+        AI: { gateway: (_name: string) => ({ getUrl: async () => 'https://gateway.example/' }) },
+        ...overrides
     } as unknown as Env
 }
 
@@ -231,5 +233,249 @@ describe('proxy forward() — happy path + bounded retry', () => {
         })
         const res = await handle(req, makeEnv(), makeCtx())
         expect(res.status).toBe(403)
+    })
+})
+
+// ─── ListModels on the Gemini-native path (Bifrost enumerates models here) ──
+
+describe('ListModels — GET /api/{provider}/v1beta/models', () => {
+    const listReq = (headers: Record<string, string> = { 'x-goog-api-key': AUTH_KEY }) =>
+        new Request('https://ob/api/google-ai-studio/v1beta/models', { method: 'GET', headers })
+
+    it('forwards to the gateway with a pooled key and returns the upstream model JSON', async () => {
+        const modelsJson = { models: [{ name: 'models/gemini-2.5-flash' }, { name: 'models/gemini-2.5-pro' }] }
+        let capturedUrl = ''
+        let capturedKey = ''
+        const fetchMock = vi.fn(async (req: Request) => {
+            capturedUrl = req.url
+            capturedKey = req.headers.get('x-goog-api-key') ?? ''
+            return new Response(JSON.stringify(modelsJson), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+            })
+        })
+        vi.stubGlobal('fetch', fetchMock)
+
+        const res = await handle(listReq(), makeEnv(), makeCtx())
+        expect(res.status).toBe(200)
+        expect(res.headers.get('Content-Type')).toContain('application/json')
+        expect(await res.json()).toEqual(modelsJson)
+        // A pooled key (secret-*) was injected — not the caller's AUTH_KEY.
+        expect(capturedKey).toMatch(/^secret-/)
+        // Gateway URL is AI.gateway().getUrl() + the rest resource, unchanged.
+        expect(capturedUrl).toBe('https://gateway.example/google-ai-studio/v1beta/models')
+        expect(fetchMock).toHaveBeenCalledTimes(1)
+    })
+
+    it('→ 503 when the provider has no active keys', async () => {
+        vi.mocked(keyService.listActiveKeysViaCache).mockResolvedValue([])
+        const res = await handle(listReq(), makeEnv(), makeCtx())
+        expect(res.status).toBe(503)
+    })
+
+    it('→ 403 with an invalid service auth key', async () => {
+        const res = await handle(listReq({ 'x-goog-api-key': 'wrong' }), makeEnv(), makeCtx())
+        expect(res.status).toBe(403)
+    })
+
+    it('retries once on a transient 5xx, then returns the 200 (GET is idempotent)', async () => {
+        const fetchMock = vi
+            .fn()
+            .mockResolvedValueOnce(new Response('upstream boom', { status: 503 }))
+            .mockResolvedValueOnce(
+                new Response('{"models":[]}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+            )
+        vi.stubGlobal('fetch', fetchMock)
+        const res = await handle(listReq(), makeEnv(), makeCtx())
+        expect(res.status).toBe(200)
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+    })
+
+    it('rotates to another key when the first pooled key is rejected (403 → 200)', async () => {
+        // One bad/blocked pooled key must not fail the whole list for a healthy pool.
+        const fetchMock = vi
+            .fn()
+            .mockResolvedValueOnce(new Response('forbidden', { status: 403 }))
+            .mockResolvedValueOnce(
+                new Response('{"models":[]}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+            )
+        vi.stubGlobal('fetch', fetchMock)
+        const res = await handle(listReq(), makeEnv(), makeCtx())
+        expect(res.status).toBe(200)
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+        // list-models rotates only — it never benches the key.
+        expect(keyService.setKeyStatus).not.toHaveBeenCalled()
+    })
+
+    it('surfaces the upstream 403 when every rotation attempt is rejected', async () => {
+        const fetchMock = vi.fn(async () => new Response('forbidden', { status: 403 }))
+        vi.stubGlobal('fetch', fetchMock)
+        const res = await handle(listReq(), makeEnv(), makeCtx())
+        expect(res.status).toBe(403) // real upstream status, not a synthetic 502
+        // maxAttempts = min(3, 3 sample keys) → 3 rotations, all 403.
+        expect(fetchMock).toHaveBeenCalledTimes(3)
+        expect(keyService.setKeyStatus).not.toHaveBeenCalled()
+    })
+
+    it('strips content-disposition from the forwarded list-models response', async () => {
+        const fetchMock = vi.fn(
+            async () =>
+                new Response('{"models":[]}', {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Disposition': 'attachment; filename="models.json"'
+                    }
+                })
+        )
+        vi.stubGlobal('fetch', fetchMock)
+        const res = await handle(listReq(), makeEnv(), makeCtx())
+        expect(res.status).toBe(200)
+        expect(res.headers.get('content-disposition')).toBeNull()
+    })
+
+    it('→ 504 + Retry-After when the gateway hangs past UPSTREAM_TIMEOUT_MS', async () => {
+        const hangingFetch = vi.fn(
+            (_input: Request, init?: { signal?: AbortSignal }) =>
+                new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener('abort', () => {
+                        const err = new Error('aborted')
+                        err.name = 'AbortError'
+                        reject(err)
+                    })
+                })
+        )
+        vi.stubGlobal('fetch', hangingFetch)
+        const res = await handle(listReq(), makeEnv({ UPSTREAM_TIMEOUT_MS: '20' }), makeCtx())
+        expect(res.status).toBe(504)
+        expect(res.headers.get('Retry-After')).toBe('1')
+    })
+
+    it('a model-specific GET (.../v1beta/models/<model>) is NOT list-models — goes through the model proxy', async () => {
+        // The version+/models anchor must exclude the per-model path. Proof: the
+        // model proxy cools the key on 429 (setKeyModelCooldownIfAvailable); the
+        // list path never does. Its having been called means forward() handled it.
+        const body429 = JSON.stringify({
+            error: {
+                code: 429,
+                details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '30s' }]
+            }
+        })
+        const fetchMock = vi.fn(async () => new Response(body429, { status: 429 }))
+        vi.stubGlobal('fetch', fetchMock)
+        const req = new Request('https://ob/api/google-ai-studio/v1beta/models/gemini-2.5-flash', {
+            method: 'GET',
+            headers: { 'x-goog-api-key': AUTH_KEY }
+        })
+        const res = await handle(req, makeEnv(), makeCtx())
+        expect(res.status).toBe(429)
+        expect(keyService.setKeyModelCooldownIfAvailable).toHaveBeenCalled()
+    })
+})
+
+// ─── Upstream timeout: AbortController gates header receipt, not the stream ──
+
+describe('upstream timeout (AbortController → 504 + Retry-After)', () => {
+    const proxyReq = () =>
+        new Request('https://ob/api/compat/v1/chat/completions', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${AUTH_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: 'google-ai-studio/gemini-2.5-flash', messages: [] })
+        })
+
+    it('returns 504 + Retry-After when the gateway hangs past UPSTREAM_TIMEOUT_MS', async () => {
+        // Never resolves on its own; rejects with AbortError when our timer fires
+        // the controller signal — exactly what a hung upstream produces under it.
+        const hangingFetch = vi.fn(
+            (_input: Request, init?: { signal?: AbortSignal }) =>
+                new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener('abort', () => {
+                        const err = new Error('aborted')
+                        err.name = 'AbortError'
+                        reject(err)
+                    })
+                })
+        )
+        vi.stubGlobal('fetch', hangingFetch)
+
+        const res = await handle(proxyReq(), makeEnv({ UPSTREAM_TIMEOUT_MS: '20' }), makeCtx())
+        expect(res.status).toBe(504)
+        expect(res.headers.get('Retry-After')).toBe('1')
+    })
+
+    it('does not abort the stream once headers are received (timer cleared)', async () => {
+        // Resolves immediately (headers in) with a tiny timeout; waiting past the
+        // timeout must NOT corrupt the body — the timer was cleared on resolve.
+        const fetchMock = vi.fn(
+            async () => new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+        )
+        vi.stubGlobal('fetch', fetchMock)
+
+        const res = await handle(proxyReq(), makeEnv({ UPSTREAM_TIMEOUT_MS: '10' }), makeCtx())
+        expect(res.status).toBe(200)
+        await new Promise(resolve => setTimeout(resolve, 40)) // outlast the 10ms timeout
+        expect(await res.json()).toEqual({ ok: true })
+    })
+
+    it('streams a body chunk that arrives AFTER the timeout window (timer gates headers, not body)', async () => {
+        // Real ReadableStream: headers resolve immediately, but the single body chunk
+        // is enqueued 60ms later — well past the 20ms header timeout. The abort timer
+        // is cleared once fetch resolves, so the late chunk must reach the client whole
+        // and not be torn by the timeout.
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                setTimeout(() => {
+                    controller.enqueue(new TextEncoder().encode('{"late":true}'))
+                    controller.close()
+                }, 60)
+            }
+        })
+        const fetchMock = vi.fn(
+            async () => new Response(stream, { status: 200, headers: { 'Content-Type': 'application/json' } })
+        )
+        vi.stubGlobal('fetch', fetchMock)
+
+        const res = await handle(proxyReq(), makeEnv({ UPSTREAM_TIMEOUT_MS: '20' }), makeCtx())
+        expect(res.status).toBe(200)
+        // Consuming the body waits for the delayed chunk; it must arrive intact.
+        expect(await res.json()).toEqual({ late: true })
+    })
+})
+
+// ─── content-disposition stripping on proxied responses ─────────────────────
+
+describe('content-disposition stripping', () => {
+    it('removes content-disposition from a forwarded upstream response', async () => {
+        const fetchMock = vi.fn(
+            async () =>
+                new Response('{"ok":true}', {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Disposition': 'attachment; filename="resp.json"'
+                    }
+                })
+        )
+        vi.stubGlobal('fetch', fetchMock)
+        const req = new Request('https://ob/api/compat/v1/chat/completions', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${AUTH_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: 'google-ai-studio/gemini-2.5-flash', messages: [] })
+        })
+        const res = await handle(req, makeEnv(), makeCtx())
+        expect(res.status).toBe(200)
+        expect(res.headers.get('content-disposition')).toBeNull()
+        expect(res.headers.get('Content-Type')).toContain('application/json')
+    })
+})
+
+// ─── /health liveness probe (top-level entrypoint) ──────────────────────────
+
+describe('GET /health', () => {
+    it('returns 200 "ok" without touching the proxy or key service', async () => {
+        const res = await worker.fetch(new Request('https://ob/health'), makeEnv(), makeCtx())
+        expect(res.status).toBe(200)
+        expect(await res.text()).toBe('ok')
+        expect(keyService.listActiveKeysViaCache).not.toHaveBeenCalled()
     })
 })
