@@ -10,10 +10,16 @@ and survives loss of the Cloudflare copy.
   - `GET /api/keys/next?provider=&model=` (auth `Authorization: Bearer ${KEY_MANAGER_TOKEN}`) → `{key, id, cooling_until}`
   - `POST /api/keys/{id}/status` → `{blocked}` | `{rate_limited, retry_after, model, provider}` | `{ok}`
   - The proxy path `/api/{provider}/...` (and `/api/compat/...`) runs the `forward()` retry loop.
-- `aiproxy.deployed.js` — the `aiproxy` worker. Thin proxy: matches `/v1beta?/models/{model}:generate|streamGenerate`,
-  calls one-balance via service binding `env.ONE_BALANCE.fetch(...)` with an AbortController timeout, filters
-  Gemini `thought_signature` warnings from SSE via TransformStream. **No retry loop** (retries are single-layer,
-  in one-balance).
+- `aiproxy.deployed.js` — the `aiproxy` worker. Thin proxy with two distinct paths:
+  - **Gemini-native** (`/v1beta?/models/{model}:generate|streamGenerate`, and `GET /v1beta/models` for ListModels) —
+    forwards to one-balance via service binding `env.ONE_BALANCE.fetch(...)` under an AbortController timeout and
+    streams the upstream body back **unchanged** (it only strips the `content-disposition` header). No SSE rewriting.
+  - **OpenAI-compat** (`/v1/chat/completions`) — auto-prefixes `provider/` onto the model and, **only on this path**,
+    runs the Gemini `thought_signature` SSE warning-filter (a `TransformStream` over the `text/event-stream` body).
+
+  So the `thought_signature`/SSE warning-filter is **scoped to the chat-completions SSE path only** — it does **not**
+  run on the Gemini-native proxying that Bifrost actually uses. **No retry loop** (retries are single-layer, in
+  one-balance).
 
 These are build artifacts, NOT the maintainable source — the clean TypeScript lives in `src/` (reconstructed
 from the upstream fork + the Key Manager additions). Do not edit the bundles; do not deploy from here.
