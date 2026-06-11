@@ -57,6 +57,15 @@ describe('cooldownSecondsFor429 — 429 classification (replaces the 24h consecu
         expect(sec).toBe(65)
     })
 
+    it('malformed RetryInfo retryDelay → 65s fallback, never a NaN cooldown', async () => {
+        // parseInt('fast') is NaN; without the guard this would bench the key for
+        // NaN seconds. The fix falls back to the safe default instead.
+        const resp = gemini429([{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: 'fast' }])
+        const sec = await cooldownSecondsFor429(resp, 'google-ai-studio')
+        expect(Number.isNaN(sec)).toBe(false)
+        expect(sec).toBe(65)
+    })
+
     it('non-google provider falls back to 65s when no rate-limit headers', async () => {
         const resp = new Response('{}', { status: 429, headers: { 'Content-Type': 'application/json' } })
         const sec = await cooldownSecondsFor429(resp, 'some-other-provider')

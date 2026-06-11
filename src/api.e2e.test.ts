@@ -122,6 +122,30 @@ describe('Key Manager vending contract', () => {
         )
     })
 
+    it('POST /api/keys/{id}/status {rate_limited, retry_after:0} is accepted and cools the key (0 is valid)', async () => {
+        // retry_after:0 is a legitimate "cool for zero extra seconds" signal; the
+        // old truthiness check (`&& body.retry_after`) rejected it as a 400.
+        const req = new Request('https://ob/api/keys/key-1/status', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${KEY_MANAGER_TOKEN}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                rate_limited: true,
+                retry_after: 0,
+                provider: 'google-ai-studio',
+                model: 'gemini-2.5-flash'
+            })
+        })
+        const res = await handle(req, makeEnv(), makeCtx())
+        expect(res.status).toBe(200)
+        expect(keyService.setKeyModelCooldownIfAvailable).toHaveBeenCalledWith(
+            expect.anything(),
+            'key-1',
+            'google-ai-studio',
+            'gemini-2.5-flash',
+            0
+        )
+    })
+
     it('POST /api/keys/{id}/status {blocked} → 400 when provider is missing (no defaulting)', async () => {
         const req = new Request('https://ob/api/keys/key-1/status', {
             method: 'POST',

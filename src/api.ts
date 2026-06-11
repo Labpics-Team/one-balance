@@ -121,7 +121,7 @@ async function handleKeysStatus(request: Request, env: Env, keyId: string): Prom
         await keyService.setKeyStatus(env, body.provider, keyId, 'blocked')
         return new Response('OK', { status: 200 })
     }
-    if (body.rate_limited && body.retry_after) {
+    if (body.rate_limited && typeof body.retry_after === 'number') {
         // provider and model are both required so the cooldown is attributed to the
         // correct (provider, model) — never defaulted, which would mis-cool keys.
         if (!body.provider) {
@@ -244,7 +244,7 @@ async function forward(
             case 401:
             case 403:
                 ctx.waitUntil(keyService.setKeyStatus(env, provider, selectedKey.id, 'blocked'))
-                console.error(`key ${selectedKey.key} is blocked due to ${respFromGateway.status}`)
+                console.error(`key ${selectedKey.id} is blocked due to ${respFromGateway.status}`)
                 if (activeKeys.length < 500) {
                     // save the CPU time for Cloudflare Free plan
                     activeKeys.splice(activeKeys.indexOf(selectedKey), 1)
@@ -259,7 +259,7 @@ async function forward(
                 sawRateLimit = true
                 lastRateLimitSec = sec
                 console.warn(
-                    `key ${selectedKey.key} cooling ${sec}s for model ${model} (429, attempt ${i + 1}/${MAX_RETRIES})`
+                    `key ${selectedKey.id} cooling ${sec}s for model ${model} (429, attempt ${i + 1}/${MAX_RETRIES})`
                 )
                 if (activeKeys.length < 500) {
                     activeKeys.splice(activeKeys.indexOf(selectedKey), 1)
@@ -337,7 +337,7 @@ function tryRandomSelect(keys: schema.Key[], model: string): schema.Key | null {
         const coolingEnd = randomKey.modelCoolings?.[model]?.end_at
 
         if (!coolingEnd || coolingEnd < now) {
-            console.info(`selected a key ${randomKey.key} to try; count: ${i + 1}`)
+            console.info(`selected a key ${randomKey.id} to try; count: ${i + 1}`)
             return randomKey
         }
     }
@@ -363,11 +363,11 @@ function selectFromAllKeys(keys: schema.Key[], model: string): schema.Key {
 
     if (availableKeys.length > 0) {
         const selectedKey = availableKeys[Math.floor(Math.random() * availableKeys.length)]
-        console.info(`selected available key ${selectedKey.key} after full scan`)
+        console.info(`selected available key ${selectedKey.id} after full scan`)
         return selectedKey
     }
 
-    console.warn(`selected a cooling key ${bestCoolingKey?.key} to try`)
+    console.warn(`selected a cooling key ${bestCoolingKey?.id} to try`)
     return bestCoolingKey! // may be available actually
 }
 
@@ -481,8 +481,15 @@ async function untilResetForGoogleAiStudio(respFromGateway: Response): Promise<n
         const retryInfoDetail = getGoogleAiStudioErrorDetail(errorBody, 'type.googleapis.com/google.rpc.RetryInfo')
         if (retryInfoDetail && retryInfoDetail.retryDelay) {
             const retrySeconds = parseInt(retryInfoDetail.retryDelay.replace('s', ''))
-            console.warn(`429 reason=RetryInfo retryDelay=${retrySeconds}s`)
-            return retrySeconds + 2 // 2 seconds buffer
+            // A malformed retryDelay (e.g. "" or "fast") makes parseInt return NaN.
+            // Never propagate a NaN cooldown — fall back to the same safe default
+            // used for an unclassified 429 instead of benching the key for NaN.
+            if (Number.isFinite(retrySeconds)) {
+                console.warn(`429 reason=RetryInfo retryDelay=${retrySeconds}s`)
+                return retrySeconds + 2 // 2 seconds buffer
+            }
+            console.warn(`429 reason=RetryInfo unparseable retryDelay='${retryInfoDetail.retryDelay}' → fallback 65s`)
+            return 65
         }
         console.warn('429 reason=unclassified (no QuotaFailure/RetryInfo) → fallback 65s')
     } catch (error) {

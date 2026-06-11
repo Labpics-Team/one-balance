@@ -56,7 +56,7 @@ async function main() {
 
     const authKey = process.env.AUTH_KEY
     if (authKey) {
-        console.log(`Setting AUTH_KEY to '${authKey}'...`)
+        console.log('Setting AUTH_KEY (value hidden)...')
         config.vars.AUTH_KEY = authKey
     }
 
