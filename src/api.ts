@@ -113,17 +113,24 @@ async function handleKeysStatus(request: Request, env: Env, keyId: string): Prom
     }
 
     if (body.blocked) {
-        const provider = body.provider ?? 'google-ai-studio'
-        await keyService.setKeyStatus(env, provider, keyId, 'blocked')
+        // provider is required: defaulting it (previously 'google-ai-studio') could
+        // mark a key of one provider blocked under another, corrupting key health.
+        if (!body.provider) {
+            return new Response('provider required for blocked', { status: 400 })
+        }
+        await keyService.setKeyStatus(env, body.provider, keyId, 'blocked')
         return new Response('OK', { status: 200 })
     }
     if (body.rate_limited && body.retry_after) {
-        const provider = body.provider ?? 'google-ai-studio'
-        const model = body.model ?? ''
-        if (!model) {
+        // provider and model are both required so the cooldown is attributed to the
+        // correct (provider, model) — never defaulted, which would mis-cool keys.
+        if (!body.provider) {
+            return new Response('provider required for rate_limited', { status: 400 })
+        }
+        if (!body.model) {
             return new Response('model required for rate_limited', { status: 400 })
         }
-        await keyService.setKeyModelCooldownIfAvailable(env, keyId, provider, model, body.retry_after)
+        await keyService.setKeyModelCooldownIfAvailable(env, keyId, body.provider, body.model, body.retry_after)
         return new Response('OK', { status: 200 })
     }
     if (body.ok) {

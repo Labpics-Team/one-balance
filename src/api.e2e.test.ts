@@ -104,7 +104,12 @@ describe('Key Manager vending contract', () => {
         const req = new Request('https://ob/api/keys/key-1/status', {
             method: 'POST',
             headers: { Authorization: `Bearer ${KEY_MANAGER_TOKEN}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ rate_limited: true, retry_after: 60, model: 'gemini-2.5-flash' })
+            body: JSON.stringify({
+                rate_limited: true,
+                retry_after: 60,
+                provider: 'google-ai-studio',
+                model: 'gemini-2.5-flash'
+            })
         })
         const res = await handle(req, makeEnv(), makeCtx())
         expect(res.status).toBe(200)
@@ -115,6 +120,28 @@ describe('Key Manager vending contract', () => {
             'gemini-2.5-flash',
             60
         )
+    })
+
+    it('POST /api/keys/{id}/status {blocked} → 400 when provider is missing (no defaulting)', async () => {
+        const req = new Request('https://ob/api/keys/key-1/status', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${KEY_MANAGER_TOKEN}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ blocked: true })
+        })
+        const res = await handle(req, makeEnv(), makeCtx())
+        expect(res.status).toBe(400)
+        expect(keyService.setKeyStatus).not.toHaveBeenCalled()
+    })
+
+    it('POST /api/keys/{id}/status {rate_limited} → 400 when provider is missing (no defaulting)', async () => {
+        const req = new Request('https://ob/api/keys/key-1/status', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${KEY_MANAGER_TOKEN}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rate_limited: true, retry_after: 60, model: 'gemini-2.5-flash' })
+        })
+        const res = await handle(req, makeEnv(), makeCtx())
+        expect(res.status).toBe(400)
+        expect(keyService.setKeyModelCooldownIfAvailable).not.toHaveBeenCalled()
     })
 
     it('POST /api/keys/{id}/status {ok} returns 200', async () => {
