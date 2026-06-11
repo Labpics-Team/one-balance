@@ -290,6 +290,87 @@ describe('ListModels — GET /api/{provider}/v1beta/models', () => {
         expect(res.status).toBe(200)
         expect(fetchMock).toHaveBeenCalledTimes(2)
     })
+
+    it('rotates to another key when the first pooled key is rejected (403 → 200)', async () => {
+        // One bad/blocked pooled key must not fail the whole list for a healthy pool.
+        const fetchMock = vi
+            .fn()
+            .mockResolvedValueOnce(new Response('forbidden', { status: 403 }))
+            .mockResolvedValueOnce(
+                new Response('{"models":[]}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+            )
+        vi.stubGlobal('fetch', fetchMock)
+        const res = await handle(listReq(), makeEnv(), makeCtx())
+        expect(res.status).toBe(200)
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+        // list-models rotates only — it never benches the key.
+        expect(keyService.setKeyStatus).not.toHaveBeenCalled()
+    })
+
+    it('surfaces the upstream 403 when every rotation attempt is rejected', async () => {
+        const fetchMock = vi.fn(async () => new Response('forbidden', { status: 403 }))
+        vi.stubGlobal('fetch', fetchMock)
+        const res = await handle(listReq(), makeEnv(), makeCtx())
+        expect(res.status).toBe(403) // real upstream status, not a synthetic 502
+        // maxAttempts = min(3, 3 sample keys) → 3 rotations, all 403.
+        expect(fetchMock).toHaveBeenCalledTimes(3)
+        expect(keyService.setKeyStatus).not.toHaveBeenCalled()
+    })
+
+    it('strips content-disposition from the forwarded list-models response', async () => {
+        const fetchMock = vi.fn(
+            async () =>
+                new Response('{"models":[]}', {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Disposition': 'attachment; filename="models.json"'
+                    }
+                })
+        )
+        vi.stubGlobal('fetch', fetchMock)
+        const res = await handle(listReq(), makeEnv(), makeCtx())
+        expect(res.status).toBe(200)
+        expect(res.headers.get('content-disposition')).toBeNull()
+    })
+
+    it('→ 504 + Retry-After when the gateway hangs past UPSTREAM_TIMEOUT_MS', async () => {
+        const hangingFetch = vi.fn(
+            (_input: Request, init?: { signal?: AbortSignal }) =>
+                new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener('abort', () => {
+                        const err = new Error('aborted')
+                        err.name = 'AbortError'
+                        reject(err)
+                    })
+                })
+        )
+        vi.stubGlobal('fetch', hangingFetch)
+        const res = await handle(listReq(), makeEnv({ UPSTREAM_TIMEOUT_MS: '20' }), makeCtx())
+        expect(res.status).toBe(504)
+        expect(res.headers.get('Retry-After')).toBe('1')
+    })
+
+    it('a model-specific GET (.../v1beta/models/<model>) is NOT list-models — goes through the model proxy', async () => {
+        // The version+/models anchor must exclude the per-model path. Proof: the
+        // model proxy cools the key on 429 (setKeyModelCooldownIfAvailable); the
+        // list path never does. Its having been called means forward() handled it.
+        const body429 = JSON.stringify({
+            error: {
+                code: 429,
+                details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '30s' }]
+            }
+        })
+        const fetchMock = vi.fn(async () => new Response(body429, { status: 429 }))
+        vi.stubGlobal('fetch', fetchMock)
+        const req = new Request('https://ob/api/google-ai-studio/v1beta/models/gemini-2.5-flash', {
+            method: 'GET',
+            headers: { 'x-goog-api-key': AUTH_KEY }
+        })
+        const res = await handle(req, makeEnv(), makeCtx())
+        expect(res.status).toBe(429)
+        expect(keyService.setKeyModelCooldownIfAvailable).toHaveBeenCalled()
+    })
 })
 
 // ─── Upstream timeout: AbortController gates header receipt, not the stream ──
@@ -334,6 +415,30 @@ describe('upstream timeout (AbortController → 504 + Retry-After)', () => {
         expect(res.status).toBe(200)
         await new Promise(resolve => setTimeout(resolve, 40)) // outlast the 10ms timeout
         expect(await res.json()).toEqual({ ok: true })
+    })
+
+    it('streams a body chunk that arrives AFTER the timeout window (timer gates headers, not body)', async () => {
+        // Real ReadableStream: headers resolve immediately, but the single body chunk
+        // is enqueued 60ms later — well past the 20ms header timeout. The abort timer
+        // is cleared once fetch resolves, so the late chunk must reach the client whole
+        // and not be torn by the timeout.
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                setTimeout(() => {
+                    controller.enqueue(new TextEncoder().encode('{"late":true}'))
+                    controller.close()
+                }, 60)
+            }
+        })
+        const fetchMock = vi.fn(
+            async () => new Response(stream, { status: 200, headers: { 'Content-Type': 'application/json' } })
+        )
+        vi.stubGlobal('fetch', fetchMock)
+
+        const res = await handle(proxyReq(), makeEnv({ UPSTREAM_TIMEOUT_MS: '20' }), makeCtx())
+        expect(res.status).toBe(200)
+        // Consuming the body waits for the delayed chunk; it must arrive intact.
+        expect(await res.json()).toEqual({ late: true })
     })
 })
 

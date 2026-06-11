@@ -258,8 +258,12 @@ function proxyResponse(upstream: Response): Response {
 
 // ListModels has no model in the path (e.g. GET /api/google-ai-studio/v1beta/models)
 // so it cannot go through the model-extraction path. It is not model-specific, so it
-// forwards with any active pooled key (no per-model cooldown) and lightly retries a
-// transient 5xx (GET is idempotent). Body is returned as-is with its content-type.
+// forwards with any active pooled key. A single randomly-picked key that is bad,
+// blocked, or throttled (401/403/429) must NOT fail the whole list for a healthy
+// pool — so on those statuses (and a transient 5xx) we rotate to another random key
+// and retry. list-models is low-stakes and the GET is idempotent, so we do not
+// bench/cool the key here (that is the proxy path's job); rotation alone is enough.
+// Body is returned as-is with its content-type.
 async function forwardListModels(
     request: Request,
     env: Env,
@@ -272,8 +276,10 @@ async function forwardListModels(
     }
 
     const timeoutMs = upstreamTimeoutMs(env)
-    const MAX_ATTEMPTS = 2
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    // A few rotations are enough to dodge one bad key; never more than the pool size.
+    const maxAttempts = Math.min(3, activeKeys.length)
+    let lastResp: Response | null = null
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const selectedKey = activeKeys[Math.floor(Math.random() * activeKeys.length)]
         const reqToGateway = await makeGatewayRequest(
             request.method,
@@ -294,22 +300,32 @@ async function forwardListModels(
             }
             throw e
         }
+        lastResp = resp
 
-        if (resp.status >= 500 && attempt < MAX_ATTEMPTS - 1) {
-            console.warn(`list-models ${provider} attempt ${attempt + 1} → ${resp.status}, retrying`)
-            continue
+        // 401/403/429 are key-specific (a bad/blocked/throttled key); 5xx is a
+        // transient upstream blip. Either way a different key may succeed — rotate.
+        const shouldRotate =
+            resp.status === 401 || resp.status === 403 || resp.status === 429 || resp.status >= 500
+        if (!shouldRotate) {
+            return proxyResponse(resp)
         }
-        return proxyResponse(resp)
+        console.warn(`list-models ${provider} attempt ${attempt + 1}/${maxAttempts} → ${resp.status}, rotating key`)
     }
 
-    return new Response('Upstream unavailable after retries', { status: 502 })
+    // Every attempt rotated (all tried keys bad/throttled or upstream down). Surface
+    // the real last upstream response so the caller sees its status/body, rather than
+    // a synthetic 502. lastResp is set: the loop runs ≥1 time (empty pool 503'd above)
+    // and a timeout returns early, so reaching here means a Response was recorded.
+    return proxyResponse(lastResp!)
 }
 
-// GET whose path ends in /v1beta/models, /v1/models, or /models (no ":action"
-// model suffix). Bifrost's google-ai-studio provider calls this to enumerate models.
+// GET whose path ends in a versioned /v1beta/models or /v1/models collection.
+// Bifrost's google-ai-studio provider calls this to enumerate models. The version
+// segment is required and the path is anchored on /models, so a model-specific path
+// (.../v1beta/models/gemini-2.5-flash) is NOT matched and falls through to the proxy.
 function isListModelsRequest(method: string, pathname: string): boolean {
     if (method !== 'GET') return false
-    return /(?:\/v1beta|\/v1)?\/models$/.test(pathname)
+    return /\/(?:v1beta|v1)\/models$/.test(pathname)
 }
 
 async function forward(
