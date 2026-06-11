@@ -17,7 +17,8 @@
     "vars": {
         "AUTH_KEY": "my-auth-key",
         "KEY_MANAGER_TOKEN": "my-key-manager-token",
-        "AI_GATEWAY": "one-balance"
+        "AI_GATEWAY": "one-balance",
+        "UPSTREAM_TIMEOUT_MS": "60000"
     },
     "observability": {
         "enabled": true

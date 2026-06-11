@@ -26,6 +26,17 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext):
 
     const provider = restResource.split('/')[0]
     const authKey = getAuthKey(request, provider)
+
+    // ListModels carries no model — auth it against the provider, then forward it
+    // with any active pooled key. Must run before model extraction (which would
+    // 400 a modelless path).
+    if (isListModelsRequest(request.method, url.pathname)) {
+        if (!util.isApiRequestAllowed(authKey, env.AUTH_KEY, provider, '')) {
+            return new Response('Invalid auth key', { status: 403 })
+        }
+        return await forwardListModels(request, env, restResource, provider)
+    }
+
     const realProviderAndModel = await extractRealProviderAndModel(request, restResource, provider)
     if (!realProviderAndModel) {
         return new Response('Not supported request: valid provider or model not found', { status: 400 })
@@ -195,6 +206,112 @@ function extractModelFromPath(restResource: string): string | null {
     return null
 }
 
+// ─── Upstream forwarding helpers (timeout + response hygiene) ───────────────
+
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 60_000
+// On an upstream timeout we return 504 with a short Retry-After: the condition is
+// transient (a hung gateway/provider, not a quota window), so the caller (Bifrost)
+// should be free to fail over / retry quickly rather than wait.
+const UPSTREAM_TIMEOUT_RETRY_AFTER_SECONDS = 1
+
+function upstreamTimeoutMs(env: Env): number {
+    const v = Number(env.UPSTREAM_TIMEOUT_MS)
+    return Number.isFinite(v) && v > 0 ? v : DEFAULT_UPSTREAM_TIMEOUT_MS
+}
+
+function isAbortError(e: unknown): boolean {
+    return e instanceof Error && e.name === 'AbortError'
+}
+
+// Bounds ONLY the receipt of response headers. Once fetch resolves, the timer is
+// cleared, so streaming the body back to the client is never aborted (same
+// semantics as aiproxy's gate, now living in one-balance after aiproxy retires).
+// Throws AbortError on timeout.
+async function fetchWithTimeout(req: Request, timeoutMs: number): Promise<Response> {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+        return await fetch(req, { signal: controller.signal })
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+function upstreamTimeoutResponse(): Response {
+    return new Response('Upstream timed out', {
+        status: 504,
+        headers: {
+            'Content-Type': 'text/plain',
+            'Retry-After': String(UPSTREAM_TIMEOUT_RETRY_AFTER_SECONDS)
+        }
+    })
+}
+
+// Re-wraps a proxied upstream response to strip content-disposition (so a JSON/SSE
+// body is never treated as a file download) without buffering the body. aiproxy
+// did this on its gemini-native path; preserved here.
+function proxyResponse(upstream: Response): Response {
+    const out = new Response(upstream.body, upstream)
+    out.headers.delete('content-disposition')
+    return out
+}
+
+// ListModels has no model in the path (e.g. GET /api/google-ai-studio/v1beta/models)
+// so it cannot go through the model-extraction path. It is not model-specific, so it
+// forwards with any active pooled key (no per-model cooldown) and lightly retries a
+// transient 5xx (GET is idempotent). Body is returned as-is with its content-type.
+async function forwardListModels(
+    request: Request,
+    env: Env,
+    restResource: string,
+    provider: string
+): Promise<Response> {
+    const activeKeys = await keyService.listActiveKeysViaCache(env, provider)
+    if (activeKeys.length === 0) {
+        return new Response('No active keys available', { status: 503 })
+    }
+
+    const timeoutMs = upstreamTimeoutMs(env)
+    const MAX_ATTEMPTS = 2
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        const selectedKey = activeKeys[Math.floor(Math.random() * activeKeys.length)]
+        const reqToGateway = await makeGatewayRequest(
+            request.method,
+            request.headers,
+            null,
+            env,
+            restResource,
+            selectedKey.key
+        )
+
+        let resp: Response
+        try {
+            resp = await fetchWithTimeout(reqToGateway, timeoutMs)
+        } catch (e) {
+            if (isAbortError(e)) {
+                console.error(`list-models ${provider} timed out after ${timeoutMs}ms`)
+                return upstreamTimeoutResponse()
+            }
+            throw e
+        }
+
+        if (resp.status >= 500 && attempt < MAX_ATTEMPTS - 1) {
+            console.warn(`list-models ${provider} attempt ${attempt + 1} → ${resp.status}, retrying`)
+            continue
+        }
+        return proxyResponse(resp)
+    }
+
+    return new Response('Upstream unavailable after retries', { status: 502 })
+}
+
+// GET whose path ends in /v1beta/models, /v1/models, or /models (no ":action"
+// model suffix). Bifrost's google-ai-studio provider calls this to enumerate models.
+function isListModelsRequest(method: string, pathname: string): boolean {
+    if (method !== 'GET') return false
+    return /(?:\/v1beta|\/v1)?\/models$/.test(pathname)
+}
+
 async function forward(
     request: Request,
     env: Env,
@@ -209,6 +326,7 @@ async function forward(
     }
 
     const body = request.body ? await request.arrayBuffer() : null
+    const timeoutMs = upstreamTimeoutMs(env)
     // Bounded retries. Each key is a separate Google project, so a few attempts
     // are enough to find one with fresh per-minute quota. Walking the whole pool
     // (the old MAX_RETRIES=30) re-sent the full body Nx and benched every key it
@@ -231,13 +349,25 @@ async function forward(
             restResource,
             selectedKey.key
         )
-        const respFromGateway = await fetch(reqToGateway)
+        let respFromGateway: Response
+        try {
+            respFromGateway = await fetchWithTimeout(reqToGateway, timeoutMs)
+        } catch (e) {
+            // Timeout receiving headers: bound the hang and let the caller fail
+            // over fast (504) instead of retrying and stacking full timeouts.
+            // Non-abort fetch errors bubble to the top-level handler (→ 500).
+            if (isAbortError(e)) {
+                console.error(`gateway timed out after ${timeoutMs}ms (attempt ${i + 1}/${MAX_RETRIES})`)
+                return upstreamTimeoutResponse()
+            }
+            throw e
+        }
         const status = respFromGateway.status
         switch (status) {
             // try block
             case 400:
                 if (!(await keyIsInvalid(respFromGateway, provider))) {
-                    return respFromGateway // user error
+                    return proxyResponse(respFromGateway) // user error
                 }
 
             // key is invalid, then continue to block and next key
@@ -275,7 +405,7 @@ async function forward(
                 continue // no backoff, just retry...
         }
 
-        return respFromGateway
+        return proxyResponse(respFromGateway)
     }
 
     // Retries exhausted. If the failures were rate limits, surface a real 429
