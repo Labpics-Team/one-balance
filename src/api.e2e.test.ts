@@ -170,6 +170,20 @@ describe('Key Manager vending contract', () => {
         expect(keyService.setKeyModelCooldownIfAvailable).not.toHaveBeenCalled()
     })
 
+    it('POST /api/keys/{id}/status {rate_limited} → 400 when retry_after is missing (no silent cooldown loss)', async () => {
+        // rate_limited without a numeric retry_after gets a precise 400 instead of
+        // falling through to the generic "invalid status body" and dropping the cooldown.
+        const req = new Request('https://ob/api/keys/key-1/status', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${KEY_MANAGER_TOKEN}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rate_limited: true, provider: 'google-ai-studio', model: 'gemini-2.5-flash' })
+        })
+        const res = await handle(req, makeEnv(), makeCtx())
+        expect(res.status).toBe(400)
+        expect(await res.text()).toContain('retry_after')
+        expect(keyService.setKeyModelCooldownIfAvailable).not.toHaveBeenCalled()
+    })
+
     it('POST /api/keys/{id}/status {ok} returns 200', async () => {
         const req = new Request('https://ob/api/keys/key-1/status', {
             method: 'POST',
@@ -351,6 +365,22 @@ describe('ListModels — GET /api/{provider}/v1beta/models', () => {
         expect(res.headers.get('Retry-After')).toBe('1')
     })
 
+    it('strips our ?key= from the forwarded upstream URL (never leak AUTH_KEY to the gateway/Google)', async () => {
+        let capturedUrl = ''
+        const fetchMock = vi.fn(async (req: Request) => {
+            capturedUrl = req.url
+            return new Response('{"models":[]}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        // Authenticate via ?key= (the google-ai-studio query style): it must authorize
+        // the caller but never appear in the URL forwarded upstream.
+        const req = new Request(`https://ob/api/google-ai-studio/v1beta/models?key=${AUTH_KEY}`, { method: 'GET' })
+        const res = await handle(req, makeEnv(), makeCtx())
+        expect(res.status).toBe(200)
+        expect(capturedUrl).not.toContain('key=')
+        expect(capturedUrl).toBe('https://gateway.example/google-ai-studio/v1beta/models')
+    })
+
     it('a model-specific GET (.../v1beta/models/<model>) is NOT list-models — goes through the model proxy', async () => {
         // The version+/models anchor must exclude the per-model path. Proof: the
         // model proxy cools the key on 429 (setKeyModelCooldownIfAvailable); the
@@ -466,6 +496,25 @@ describe('content-disposition stripping', () => {
         expect(res.status).toBe(200)
         expect(res.headers.get('content-disposition')).toBeNull()
         expect(res.headers.get('Content-Type')).toContain('application/json')
+    })
+
+    it('removes set-cookie from a forwarded upstream response', async () => {
+        const fetchMock = vi.fn(
+            async () =>
+                new Response('{"ok":true}', {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json', 'Set-Cookie': 'sess=abc; HttpOnly' }
+                })
+        )
+        vi.stubGlobal('fetch', fetchMock)
+        const req = new Request('https://ob/api/compat/v1/chat/completions', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${AUTH_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: 'google-ai-studio/gemini-2.5-flash', messages: [] })
+        })
+        const res = await handle(req, makeEnv(), makeCtx())
+        expect(res.status).toBe(200)
+        expect(res.headers.get('set-cookie')).toBeNull()
     })
 })
 
