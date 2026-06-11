@@ -63,3 +63,39 @@ describe('cooldownSecondsFor429 — 429 classification (replaces the 24h consecu
         expect(sec).toBe(65)
     })
 })
+
+// Builds an OpenRouter-style 429 with the given headers (X-RateLimit-Reset is a
+// unix timestamp in MILLISECONDS, per OpenRouter's API).
+function openrouter429(headers: Record<string, string>): Response {
+    return new Response('{}', { status: 429, headers })
+}
+
+describe('cooldownSecondsFor429 — OpenRouter (untilResetForOpenrouter via X-RateLimit-Reset)', () => {
+    it('valid future X-RateLimit-Reset → (reset - now)/1000 + 5s buffer', async () => {
+        const now = Date.now()
+        const resetMs = now + 30_000 // resets in 30s
+        const resp = openrouter429({ 'X-RateLimit-Reset': String(resetMs) })
+        const sec = await cooldownSecondsFor429(resp, 'openrouter')
+        // floor(~30000/1000) + 5 = 35 (allow 1s slack for test-execution drift).
+        expect(sec).toBeGreaterThanOrEqual(34)
+        expect(sec).toBeLessThanOrEqual(35)
+    })
+
+    it('missing X-RateLimit-Reset header → 65s fallback', async () => {
+        const resp = openrouter429({ 'Content-Type': 'application/json' })
+        const sec = await cooldownSecondsFor429(resp, 'openrouter')
+        expect(sec).toBe(65)
+    })
+
+    it('malformed (non-numeric) X-RateLimit-Reset → 65s fallback, never throws', async () => {
+        const resp = openrouter429({ 'X-RateLimit-Reset': 'not-a-number' })
+        const sec = await cooldownSecondsFor429(resp, 'openrouter')
+        expect(sec).toBe(65)
+    })
+
+    it('past X-RateLimit-Reset (already elapsed) → 65s fallback', async () => {
+        const resp = openrouter429({ 'X-RateLimit-Reset': String(Date.now() - 10_000) })
+        const sec = await cooldownSecondsFor429(resp, 'openrouter')
+        expect(sec).toBe(65)
+    })
+})
