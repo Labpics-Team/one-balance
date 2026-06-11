@@ -16,7 +16,14 @@ function getAuthHeaderName(provider: string): string {
 
 export async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
-    const restResource = url.pathname.substring('/api/'.length) + url.search
+    // Strip our own `?key=` (the google-ai-studio auth-via-query style) from what we
+    // forward upstream. The pooled key always goes in the auth header; leaking our
+    // AUTH_KEY into the gateway/Google URL would expose it in their logs and — if
+    // Google preferred a query key over the header — get a HEALTHY pooled key benched
+    // as API_KEY_INVALID. Header-based auth (what Bifrost uses) is unaffected.
+    const forwardUrl = new URL(request.url)
+    forwardUrl.searchParams.delete('key')
+    const restResource = forwardUrl.pathname.substring('/api/'.length) + forwardUrl.search
 
     // Key Manager API (consumed by ai-node): vend a key / report its status.
     // Authenticated by KEY_MANAGER_TOKEN, separate from the proxy auth below.
@@ -132,7 +139,7 @@ async function handleKeysStatus(request: Request, env: Env, keyId: string): Prom
         await keyService.setKeyStatus(env, body.provider, keyId, 'blocked')
         return new Response('OK', { status: 200 })
     }
-    if (body.rate_limited && typeof body.retry_after === 'number') {
+    if (body.rate_limited) {
         // provider and model are both required so the cooldown is attributed to the
         // correct (provider, model) — never defaulted, which would mis-cool keys.
         if (!body.provider) {
@@ -140,6 +147,13 @@ async function handleKeysStatus(request: Request, env: Env, keyId: string): Prom
         }
         if (!body.model) {
             return new Response('model required for rate_limited', { status: 400 })
+        }
+        // retry_after must be an explicit number (0 is valid — "cool for zero extra
+        // seconds"). A missing/non-numeric value gets its own precise 400 instead of
+        // silently falling through to the generic "invalid status body" — which would
+        // drop the cooldown and hide the cause from the caller.
+        if (typeof body.retry_after !== 'number') {
+            return new Response('retry_after (number) required for rate_limited', { status: 400 })
         }
         await keyService.setKeyModelCooldownIfAvailable(env, keyId, body.provider, body.model, body.retry_after)
         return new Response('OK', { status: 200 })
@@ -253,6 +267,9 @@ function upstreamTimeoutResponse(): Response {
 function proxyResponse(upstream: Response): Response {
     const out = new Response(upstream.body, upstream)
     out.headers.delete('content-disposition')
+    // Don't pass an upstream Set-Cookie (Google / AI Gateway internals) back to the
+    // caller — one-balance is not a session boundary and the cookie is never ours.
+    out.headers.delete('set-cookie')
     return out
 }
 
@@ -276,11 +293,15 @@ async function forwardListModels(
     }
 
     const timeoutMs = upstreamTimeoutMs(env)
-    // A few rotations are enough to dodge one bad key; never more than the pool size.
-    const maxAttempts = Math.min(3, activeKeys.length)
+    // Rotate WITHOUT replacement: a key that just failed must not be retried within
+    // this same call (otherwise on a tiny pool a single bad key can burn every
+    // attempt). A few rotations are enough to dodge one bad key; never more than the
+    // pool size. We mutate a copy so the cached pool array is untouched.
+    const candidates = [...activeKeys]
+    const maxAttempts = Math.min(3, candidates.length)
     let lastResp: Response | null = null
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const selectedKey = activeKeys[Math.floor(Math.random() * activeKeys.length)]
+        const selectedKey = candidates.splice(Math.floor(Math.random() * candidates.length), 1)[0]
         const reqToGateway = await makeGatewayRequest(
             request.method,
             request.headers,
